@@ -16,14 +16,21 @@
 #endif // _stat
 #endif // _WIN32
 
-extern bool print_debug_info, serve_cache_on_fetch_fail;
-extern int global_log_level;
+extern bool gPrintDbgInfo, gServeCacheOnFetchFail;
+extern int gLogLevel;
 
 typedef std::lock_guard<std::mutex> guarded_mutex;
 std::mutex cache_rw_lock;
 
+long gMaxAllowedDownloadSize = 1048576L;
+
 //std::string user_agent_str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/74.0.3729.169 Safari/537.36";
-std::string user_agent_str = "subconverter/" + std::string(VERSION) + " cURL/" + std::string(LIBCURL_VERSION);
+std::string user_agent_str = "subconverter/" VERSION " cURL/" LIBCURL_VERSION;
+
+struct curl_progress_data
+{
+    long size_limit = 0L;
+};
 
 static inline void curl_init()
 {
@@ -45,57 +52,133 @@ static int writer(char *data, size_t size, size_t nmemb, std::string *writerData
     return size * nmemb;
 }
 
-static inline void curl_set_common_options(CURL *curl_handle, const char *url)
+static int dummy_writer(char *data, size_t size, size_t nmemb, void *writerData)
+{
+    /// dummy writer, do not save anything
+    (void)data;
+    (void)writerData;
+    return size * nmemb;
+}
+
+static int size_checker(void *clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow)
+{
+    if(clientp)
+    {
+        curl_progress_data *data = reinterpret_cast<curl_progress_data*>(clientp);
+        if(data->size_limit)
+        {
+            if(dltotal > data->size_limit || dlnow > data->size_limit)
+                return 1;
+        }
+    }
+    return 0;
+}
+
+static inline void curl_set_common_options(CURL *curl_handle, const char *url, curl_progress_data *data)
 {
     curl_easy_setopt(curl_handle, CURLOPT_URL, url);
-    curl_easy_setopt(curl_handle, CURLOPT_VERBOSE, global_log_level == LOG_LEVEL_VERBOSE ? 1L : 0L);
-    curl_easy_setopt(curl_handle, CURLOPT_NOPROGRESS, 1L);
+    curl_easy_setopt(curl_handle, CURLOPT_VERBOSE, gLogLevel == LOG_LEVEL_VERBOSE ? 1L : 0L);
+    curl_easy_setopt(curl_handle, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(curl_handle, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl_handle, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl_handle, CURLOPT_MAXREDIRS, 20L);
     curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYHOST, 0L);
     curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, 15L);
     curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, user_agent_str.data());
+    if(data)
+    {
+        if(data->size_limit)
+            curl_easy_setopt(curl_handle, CURLOPT_MAXFILESIZE, data->size_limit);
+        curl_easy_setopt(curl_handle, CURLOPT_XFERINFOFUNCTION, size_checker);
+        curl_easy_setopt(curl_handle, CURLOPT_XFERINFODATA, data);
+    }
 }
 
-static std::string curlGet(std::string url, std::string proxy, std::string &response_headers, CURLcode &return_code)
+//static std::string curlGet(const std::string &url, const std::string &proxy, std::string &response_headers, CURLcode &return_code, const string_map &request_headers)
+static int curlGet(const FetchArgument &argument, FetchResult &result)
 {
     CURL *curl_handle;
-    std::string data;
+    std::string *data = result.content, new_url = argument.url;
+    struct curl_slist *list = NULL;
+    defer(curl_slist_free_all(list);)
     long retVal = 0;
 
     curl_init();
 
     curl_handle = curl_easy_init();
-    curl_set_common_options(curl_handle, url.data());
-    curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, writer);
-    curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &data);
-    curl_easy_setopt(curl_handle, CURLOPT_HEADERFUNCTION, writer);
-    curl_easy_setopt(curl_handle, CURLOPT_HEADERDATA, &response_headers);
-    if(proxy != "")
-        curl_easy_setopt(curl_handle, CURLOPT_PROXY, proxy.data());
+    if(argument.proxy.size())
+    {
+        if(startsWith(argument.proxy, "cors:"))
+        {
+            list = curl_slist_append(list, "X-Requested-With: subconverter " VERSION);
+            new_url = argument.proxy.substr(5) + argument.url;
+        }
+        else
+            curl_easy_setopt(curl_handle, CURLOPT_PROXY, argument.proxy.data());
+    }
+    curl_progress_data limit;
+    limit.size_limit = gMaxAllowedDownloadSize;
+    curl_set_common_options(curl_handle, new_url.data(), &limit);
 
-    return_code = curl_easy_perform(curl_handle);
+    if(argument.request_headers)
+    {
+        for(auto &x : *argument.request_headers)
+            list = curl_slist_append(list, (x.first + ": " + x.second).data());
+    }
+    list = curl_slist_append(list, "SubConverter-Request: 1");
+    list = curl_slist_append(list, "SubConverter-Version: " VERSION);
+    if(list)
+        curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, list);
+
+    if(result.content)
+    {
+        curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, writer);
+        curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, result.content);
+    }
+    else
+        curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, dummy_writer);
+    if(result.response_headers)
+    {
+        curl_easy_setopt(curl_handle, CURLOPT_HEADERFUNCTION, writer);
+        curl_easy_setopt(curl_handle, CURLOPT_HEADERDATA, result.response_headers);
+    }
+    else
+        curl_easy_setopt(curl_handle, CURLOPT_HEADERFUNCTION, dummy_writer);
+
+    unsigned int fail_count = 0, max_fails = 1;
+    while(true)
+    {
+        *result.status_code = curl_easy_perform(curl_handle);
+        if(*result.status_code == CURLE_OK || max_fails >= fail_count)
+            break;
+        else
+            fail_count++;
+    }
+
     curl_easy_getinfo(curl_handle, CURLINFO_HTTP_CODE, &retVal);
     curl_easy_cleanup(curl_handle);
 
-    if(return_code != CURLE_OK || retVal != 200)
-        data.clear();
-    data.shrink_to_fit();
+    if(data)
+    {
+        if(*result.status_code != CURLE_OK || retVal != 200)
+            data->clear();
+        data->shrink_to_fit();
+    }
 
-    return data;
+    return *result.status_code;
 }
 
 // data:[<mediatype>][;base64],<data>
-static std::string dataGet(std::string url)
+static std::string dataGet(const std::string &url)
 {
     if (!startsWith(url, "data:"))
-        return "";
+        return std::string();
     std::string::size_type comma = url.find(',');
-    if (comma == std::string::npos)
-        return "";
+    if (comma == std::string::npos || comma == url.size() - 1)
+        return std::string();
 
-    std::string data = UrlDecode(url.substr(comma));
+    std::string data = UrlDecode(url.substr(comma + 1));
     if (endsWith(url.substr(0, comma), ";base64")) {
         return urlsafe_base64_decode(data);
     } else {
@@ -103,17 +186,21 @@ static std::string dataGet(std::string url)
     }
 }
 
-std::string buildSocks5ProxyString(std::string addr, int port, std::string username, std::string password)
+std::string buildSocks5ProxyString(const std::string &addr, int port, const std::string &username, const std::string &password)
 {
-    std::string authstr = username != "" && password != "" ? username + ":" + password + "@" : "";
+    std::string authstr = username.size() && password.size() ? username + ":" + password + "@" : "";
     std::string proxystr = "socks5://" + authstr + addr + ":" + std::to_string(port);
     return proxystr;
 }
 
-std::string webGet(std::string url, std::string proxy, std::string &response_headers, unsigned int cache_ttl)
+std::string webGet(const std::string &url, const std::string &proxy, unsigned int cache_ttl, std::string *response_headers, string_map *request_headers)
 {
+    int return_code = 0;
     std::string content;
-    CURLcode return_code;
+
+    FetchArgument argument {url, proxy, request_headers, cache_ttl};
+    FetchResult fetch_res {&return_code, &content, response_headers};
+
     if (startsWith(url, "data:"))
         return dataGet(url);
     // cache system
@@ -130,50 +217,44 @@ std::string webGet(std::string url, std::string proxy, std::string &response_hea
             {
                 writeLog(0, "CACHE HIT: '" + url + "', using local cache.");
                 guarded_mutex guard(cache_rw_lock);
-                response_headers = fileGet(path_header, true);
+                if(response_headers)
+                    *response_headers = fileGet(path_header, true);
                 return fileGet(path, true);
             }
             writeLog(0, "CACHE MISS: '" + url + "', TTL timeout, creating new cache."); // out of TTL
         }
         else
             writeLog(0, "CACHE NOT EXIST: '" + url + "', creating new cache.");
-        content = curlGet(url, proxy, response_headers, return_code); // try to fetch data
+        //content = curlGet(url, proxy, response_headers, return_code); // try to fetch data
+        curlGet(argument, fetch_res);
         if(return_code == CURLE_OK) // success, save new cache
         {
             guarded_mutex guard(cache_rw_lock);
             fileWrite(path, content, true);
-            fileWrite(path_header, response_headers, true);
+            if(response_headers)
+                fileWrite(path_header, *response_headers, true);
         }
         else
         {
-            if(fileExist(path) && serve_cache_on_fetch_fail) // failed, check if cache exist
+            if(fileExist(path) && gServeCacheOnFetchFail) // failed, check if cache exist
             {
                 writeLog(0, "Fetch failed. Serving cached content."); // cache exist, serving cache
                 guarded_mutex guard(cache_rw_lock);
                 content = fileGet(path, true);
-                response_headers = fileGet(path_header, true);
+                if(response_headers)
+                    *response_headers = fileGet(path_header, true);
             }
             else
                 writeLog(0, "Fetch failed. No local cache available."); // cache not exist or not allow to serve cache, serving nothing
         }
         return content;
     }
-    return curlGet(url, proxy, response_headers, return_code);
+    //return curlGet(url, proxy, response_headers, return_code);
+    curlGet(argument, fetch_res);
+    return content;
 }
 
-std::string webGet(std::string url, std::string proxy)
-{
-    std::string dummy;
-    return webGet(url, proxy, dummy);
-}
-
-std::string webGet(std::string url, std::string proxy, unsigned int cache_ttl)
-{
-    std::string dummy;
-    return webGet(url, proxy, dummy, cache_ttl);
-}
-
-int curlPost(std::string url, std::string data, std::string proxy, std::string auth_token, std::string *retData)
+int curlPost(const std::string &url, const std::string &data, const std::string &proxy, const string_array &request_headers, std::string *retData)
 {
     CURL *curl_handle;
     CURLcode res;
@@ -183,18 +264,18 @@ int curlPost(std::string url, std::string data, std::string proxy, std::string a
     curl_init();
     curl_handle = curl_easy_init();
     list = curl_slist_append(list, "Content-Type: application/json;charset='utf-8'");
-    if(auth_token.size())
-        list = curl_slist_append(list, std::string("Authorization: token " + auth_token).data());
+    for(const std::string &x : request_headers)
+        list = curl_slist_append(list, x.data());
 
-    curl_set_common_options(curl_handle, url.data());
+    curl_progress_data limit;
+    curl_set_common_options(curl_handle, url.data(), &limit);
     curl_easy_setopt(curl_handle, CURLOPT_POST, 1L);
     curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, data.data());
     curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDSIZE, data.size());
     curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, writer);
     curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, retData);
     curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, list);
-    curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, user_agent_str.data());
-    if(proxy != "")
+    if(proxy.size())
         curl_easy_setopt(curl_handle, CURLOPT_PROXY, proxy.data());
 
     res = curl_easy_perform(curl_handle);
@@ -202,7 +283,7 @@ int curlPost(std::string url, std::string data, std::string proxy, std::string a
 
     if(res == CURLE_OK)
     {
-        res = curl_easy_getinfo(curl_handle, CURLINFO_HTTP_CODE, &retVal);
+        curl_easy_getinfo(curl_handle, CURLINFO_HTTP_CODE, &retVal);
     }
 
     curl_easy_cleanup(curl_handle);
@@ -210,12 +291,12 @@ int curlPost(std::string url, std::string data, std::string proxy, std::string a
     return retVal;
 }
 
-int webPost(std::string url, std::string data, std::string proxy, std::string auth_token, std::string *retData)
+int webPost(const std::string &url, const std::string &data, const std::string &proxy, const string_array &request_headers, std::string *retData)
 {
-    return curlPost(url, data, proxy, auth_token, retData);
+    return curlPost(url, data, proxy, request_headers, retData);
 }
 
-int curlPatch(std::string url, std::string data, std::string proxy, std::string auth_token, std::string *retData)
+int curlPatch(const std::string &url, const std::string &data, const std::string &proxy, const string_array &request_headers, std::string *retData)
 {
     CURL *curl_handle;
     CURLcode res;
@@ -227,18 +308,18 @@ int curlPatch(std::string url, std::string data, std::string proxy, std::string 
     curl_handle = curl_easy_init();
 
     list = curl_slist_append(list, "Content-Type: application/json;charset='utf-8'");
-    if(auth_token.size())
-        list = curl_slist_append(list, std::string("Authorization: token " + auth_token).data());
+    for(const std::string &x : request_headers)
+        list = curl_slist_append(list, x.data());
 
-    curl_set_common_options(curl_handle, url.data());
+    curl_progress_data limit;
+    curl_set_common_options(curl_handle, url.data(), &limit);
     curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, "PATCH");
     curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, data.data());
     curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDSIZE, data.size());
     curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, writer);
     curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, retData);
     curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, list);
-    curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, user_agent_str.data());
-    if(proxy != "")
+    if(proxy.size())
         curl_easy_setopt(curl_handle, CURLOPT_PROXY, proxy.data());
 
     res = curl_easy_perform(curl_handle);
@@ -253,7 +334,46 @@ int curlPatch(std::string url, std::string data, std::string proxy, std::string 
     return retVal;
 }
 
-int webPatch(std::string url, std::string data, std::string proxy, std::string auth_token, std::string *retData)
+int webPatch(const std::string &url, const std::string &data, const std::string &proxy, const string_array &request_headers, std::string *retData)
 {
-    return curlPatch(url, data, proxy, auth_token, retData);
+    return curlPatch(url, data, proxy, request_headers, retData);
+}
+
+int curlHead(const std::string &url, const std::string &proxy, const string_array &request_headers, std::string &response_headers)
+{
+    CURL *curl_handle;
+    CURLcode res;
+    long retVal = 0;
+    struct curl_slist *list = NULL;
+
+    curl_init();
+
+    curl_handle = curl_easy_init();
+
+    list = curl_slist_append(list, "Content-Type: application/json;charset='utf-8'");
+    for(const std::string &x : request_headers)
+        list = curl_slist_append(list, x.data());
+
+    curl_progress_data limit;
+    curl_set_common_options(curl_handle, url.data(), &limit);
+    curl_easy_setopt(curl_handle, CURLOPT_HEADERFUNCTION, writer);
+    curl_easy_setopt(curl_handle, CURLOPT_HEADERDATA, &response_headers);
+    curl_easy_setopt(curl_handle, CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, list);
+    if(proxy.size())
+        curl_easy_setopt(curl_handle, CURLOPT_PROXY, proxy.data());
+
+    res = curl_easy_perform(curl_handle);
+    curl_slist_free_all(list);
+    if(res == CURLE_OK)
+        res = curl_easy_getinfo(curl_handle, CURLINFO_HTTP_CODE, &retVal);
+
+    curl_easy_cleanup(curl_handle);
+
+    return retVal;
+}
+
+int webHead(const std::string &url, const std::string &proxy, const string_array &request_headers, std::string &response_headers)
+{
+    return curlHead(url, proxy, request_headers, response_headers);
 }
