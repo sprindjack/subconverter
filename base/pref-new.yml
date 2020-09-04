@@ -7,8 +7,14 @@ common:
   prepend_insert_url: true
   exclude_remarks: ["(到期|剩余流量|时间|官网|产品)"]
   include_remarks: []
-  enable_filter: false
-  filter_script: ""
+  enable_filter: true
+  filter_script: "
+  function filter(node) {
+  const info = JSON.parse(node.ProxyInfo);
+  if(info.Port == "443")
+    return true;
+  return false;
+}"
   default_external_config: "" # config/example_external_config.yml
   base_path: base
   clash_rule_base: base/all_base.tpl
@@ -142,10 +148,3 @@ advanced:
   cache_ruleset: 21600
   async_fetch_ruleset: false
   skip_failed_links: false
-  
-function filter(node) {
-  const info = JSON.parse(node.ProxyInfo);
-  if(info.Port == "443")
-    return true;
-  return false;
-}
