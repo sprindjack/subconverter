@@ -142,3 +142,10 @@ advanced:
   cache_ruleset: 21600
   async_fetch_ruleset: false
   skip_failed_links: false
+  
+function filter(node) {
+  const info = JSON.parse(node.ProxyInfo);
+  if(info.Port == "443")
+    return true;
+  return false;
+}
