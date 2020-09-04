@@ -8,13 +8,8 @@ common:
   exclude_remarks: ["(到期|剩余流量|时间|官网|产品)"]
   include_remarks: []
   enable_filter: true
-  filter_script: "
-  function filter(node) {
-  const info = JSON.parse(node.ProxyInfo);
-  if(info.Port == "443")
-    return true;
-  return false;
-}"
+  filter_script: "filter_script=function filter(node) {\n    const info = JSON.parse(node.ProxyInfo);\n    if(info.Port== "443")\n        return true;\n    return false;\n}
+"
   default_external_config: "" # config/example_external_config.yml
   base_path: base
   clash_rule_base: base/all_base.tpl
